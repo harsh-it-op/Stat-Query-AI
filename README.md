@@ -19,14 +19,14 @@ license: mit
 <img src="assets/banner3.png" alt="SatQuery AI" width="1000" />
 
 [![OpenEnv](https://img.shields.io/badge/SIH-2026-blue?style=flat-square)](https://www.sih.gov.in/)
-[![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace%20Spaces-yellow?style=flat-square)](https://huggingface.co/spaces/imadityasarkar/satquery-backend)
+[![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace%20Spaces-yellow?style=flat-square)](https://huggingface.co/spaces/HARSHITSINGH/satquery-backend)
 [![Vercel](https://img.shields.io/badge/Vercel-Live-black?style=flat-square)](https://sat-query-ai-sih-26.vercel.app)
 [![VLM](https://img.shields.io/badge/VLM-Qwen2--VL--2B-purple?style=flat-square)](#tech-stack)
 [![Trace](https://img.shields.io/badge/ExecutionTrace-Graded-red?style=flat-square)](#how-it-works--pipeline-flowchart)
 
 Smart India Hackathon 2026 — Agentic Vision-Language Intelligence for Earth Observation
 
-[🚀 Live App](https://sat-query-ai-sih-26.vercel.app) · [🛰️ Live Space](https://huggingface.co/spaces/imadityasarkar/satquery-ai) · [📓 Training Notebook](https://colab.research.google.com/github/awdtyo/SatQueryAI-SIH26/blob/main/training/notebooks/satquery_ai_qlora_finetune.ipynb) · [📝 Execution Trace](docs/execution_trace_schema.md)
+[🚀 Live App](https://sat-query-ai-sih-26.vercel.app) · [🛰️ Live Space](https://huggingface.co/spaces/HARSHITSINGH/satquery-ai) · [📓 Training Notebook](https://colab.research.google.com/github/awdtyo/SatQueryAI-SIH26/blob/main/training/notebooks/satquery_ai_qlora_finetune.ipynb) · [📝 Execution Trace](docs/execution_trace_schema.md)
 
 </div>
 
@@ -72,7 +72,7 @@ SatQuery returns:
   "chart_type": "distribution",
   "execution_trace": {
     "task": "vqa",
-    "models_used": [{ "name": "imadityasarkar/satquery-phase2-vrsbench", "role": "vqa", "is_real": true, "latency_ms": 842 }]
+    "models_used": [{ "name": "satquery-phase2-vrsbench", "role": "vqa", "is_real": true, "latency_ms": 842 }]
   }
 }
 ```
@@ -108,10 +108,10 @@ No full fine-tuning, no 7B+ model — same math as flown adapters on the Hub. `2
 
 | Specialist | Module | Adapter / Weight | Status | Task keys |
 |---|---|---|---|---|
-| **VQA / Captioning** | `backend/models/vqa.py:82` | `imadityasarkar/satquery-phase2-vrsbench` (Qwen2-VL-2B + QLoRA, continues stage-1) | **REAL** | `vqa`, `captioning`, `visual_question_answering` |
+| **VQA / Captioning** | `backend/models/vqa.py:82` | `HARSHITSINGH/satquery-phase2-vrsbench` (Qwen2-VL-2B + QLoRA, continues stage-1) | **REAL** | `vqa`, `captioning`, `visual_question_answering` |
 | **Counting** | `backend/models/yolo.py:75` | `yolov8n.pt` (Ultralytics, 6 MB, COCO-80) | **REAL** | `count`, `counting` |
-| **Change Detection** | `backend/models/change.py:82` | `imadityasarkar/cdvqa_change` (bi-temporal QLoRA, stage-3) | **REAL** | `change_detection`, `change`, `cdvqa` |
-| **Optical-SAR Fusion** | `backend/models/fusion.py:80` | `imadityasarkar/satquery-phase2-vrsbench` (fusion-aware) | **REAL** | `optical_sar_fusion`, `fusion`, `sar` |
+| **Change Detection** | `backend/models/change.py:82` | `HARSHITSINGH/cdvqa_change` (bi-temporal QLoRA, stage-3) | **REAL** | `change_detection`, `change`, `cdvqa` |
+| **Optical-SAR Fusion** | `backend/models/fusion.py:80` | `HARSHITSINGH/satquery-phase2-vrsbench` (fusion-aware) | **REAL** | `optical_sar_fusion`, `fusion`, `sar` |
 | **Grounding** | `backend/models/grounding.py:14` | — | **REAL** | `grounding`, `visual_grounding` |
 
 All five are registered in `backend/registry.py:31` and health-reported at `GET /health`. `is_real` is derived lazily per module (`get_model_info()`).
@@ -195,9 +195,9 @@ For each stage, QLoRA adapts the frozen 2B base with 4-bit NF4 + LoRA `r16 α32 
 
 | Stage | Dataset | Adapter | Purpose | Config |
 |---|---|---|---|---|
-| **1** | BigEarthNet Sentinel-2 `800` (val 5%) | `imadityasarkar/satquery-qwen2vl-stage1-bigearthnet` | Vision-language adaptation — `Describe land cover` | `training/configs/bigearthnet_stage1.json` |
-| **2** | VRSBench / RSVQA `1200` (val 5%) | `imadityasarkar/satquery-phase2-vrsbench` | VQA + grounding — `Where is…` / counting | `training/configs/vrsbench_rsvqa_stage2.json` |
-| **3** | CDVQA `1000` bi-temporal (paired `T1,T2`) | `imadityasarkar/cdvqa_change` | Change — `What changed between dates?` | `training/configs/cdvqa_stage3.json` |
+| **1** | BigEarthNet Sentinel-2 `800` (val 5%) | `HARSHITSINGH/satquery-qwen2vl-stage1-bigearthnet` | Vision-language adaptation — `Describe land cover` | `training/configs/bigearthnet_stage1.json` |
+| **2** | VRSBench / RSVQA `1200` (val 5%) | `HARSHITSINGH/satquery-phase2-vrsbench` | VQA + grounding — `Where is…` / counting | `training/configs/vrsbench_rsvqa_stage2.json` |
+| **3** | CDVQA `1000` bi-temporal (paired `T1,T2`) | `HARSHITSINGH/cdvqa_change` | Change — `What changed between dates?` | `training/configs/cdvqa_stage3.json` |
 
 Each stage reuses the previous adapter (`adapter_to_continue`), its own `CHECKPOINT_DIR` on Drive, and `save_steps 25` auto-resume — safe to `Run all` again after Colab disconnect. Notebooks live in `training/notebooks/`:
 
@@ -211,21 +211,21 @@ Each stage reuses the previous adapter (`adapter_to_continue`), its own `CHECKPO
 
 ### Stage-1 Adapter
 
-- **Hub:** `imadityasarkar/satquery-qwen2vl-stage1-bigearthnet` (30–80 MB LoRA, base 2B frozen)
+- **Hub:** `HARSHITSINGH/satquery-qwen2vl-stage1-bigearthnet` (30–80 MB LoRA, base 2B frozen)
 - **Data:** `image → "Describe the land cover"` → `answer="This Sentinel-2 image shows predominantly {forest|urban fabric|arable land|...}"`
 - **Training:** 1 epoch, 800 train / 40 val, `save_steps 25` → `checkpoint-25,50,...` on Drive, resume-safe
 - **Performance:** `~842ms` T4 fp16 (`~70s` on i5 CPU `FORCE_CPU=1`), `30–80MB` adapter, `is_real` via `GET /health`
 
 ### Stage-2 Adapter (Live, default)
 
-- **Hub:** `imadityasarkar/satquery-phase2-vrsbench` — **current default** via `backend/config.py:24` `ADAPTER_PATH`
+- **Hub:** `HARSHITSINGH/satquery-phase2-vrsbench` — **current default** via `backend/config.py:24` `ADAPTER_PATH`
 - **Data:** VRSBench/RSVQA `1200` (val 5%) `image + question → answer` + counting/grounding
 - **Training:** 1 epoch, 1200 train / 60 val, `lr 1e-4` cosine, `save_steps 25` → Drive `stage2_vrsbench_sft/checkpoint-*`, resume-safe; continues from stage-1 (`vrsbench_rsvqa_stage2.json:3`)
 - **Inference:** VQA + fusion real via same adapter; YOLO handles counting; `is_real true` for `single` VQA/fusion and `count`
 
 ### Stage-3 Adapter (Live, bi-temporal)
 
-- **Hub:** `imadityasarkar/cdvqa_change` (public) — via `backend/config.py:114` `CHANGE_ADAPTER_PATH`, continues stage-2
+- **Hub:** `HARSHITSINGH/cdvqa_change` (public) — via `backend/config.py:114` `CHANGE_ADAPTER_PATH`, continues stage-2
 - **Data:** CDVQA `1000` paired `T1+T2` (val 5%), change-specific system prompt, `image_max_pixels 301056` for two images
 - **Training:** 1 epoch, paired tokenization `processor(images=[T1,T2])`, `save_steps 25` → `stage3_cdvqa_change/checkpoint-*`
 - **Inference:** `bi-temporal` → `change_detection` is **real** (was stub until `b0d1b4a`); chart is `delta T2−T1`
@@ -338,7 +338,7 @@ print(r.json()["answer"])
 
 ### Run via HF Spaces (ZeroGPU)
 
-Space: `https://huggingface.co/spaces/imadityasarkar/satquery-backend` — Gradio `zero-a10g` `app.py` with `@spaces.GPU(duration=60)` (`SATQUERY_FORCE_CPU=0` enables 4-bit on Blackwell, `~1s` vs `~70s` CPU; 60s covers warm inference + typical cold pull while billing half the quota of 120s — ZeroGPU deducts requested seconds per call). Frontend is `app.py` Blocks; local React console remains at `5173`. Health is cheap (no model load) unless `SATQUERY_HEALTH_LOAD_MODEL=1`.
+Space: `https://huggingface.co/spaces/HARSHITSINGH/satquery-backend` — Gradio `zero-a10g` `app.py` with `@spaces.GPU(duration=60)` (`SATQUERY_FORCE_CPU=0` enables 4-bit on Blackwell, `~1s` vs `~70s` CPU; 60s covers warm inference + typical cold pull while billing half the quota of 120s — ZeroGPU deducts requested seconds per call). Frontend is `app.py` Blocks; local React console remains at `5173`. Health is cheap (no model load) unless `SATQUERY_HEALTH_LOAD_MODEL=1`.
 
 ### Run via Docker (CPU or auto-GPU)
 
@@ -399,7 +399,7 @@ Each notebook (stage-1 `satquery_ai_qlora_finetune.ipynb`, stage-2 `vrsbench_rsv
 3. Installs `transformers peft accelerate bitsandbytes qwen-vl-utils` (no torch upgrade)
 4. Loads `Qwen2-VL-2B` in 4-bit + `AutoProcessor(min 256*28*28 max 512*28*28)` (+ previous stage adapter via `PeftModel.from_pretrained` for stage 2/3)
 5. Tokenizes `apply_chat_template` with `label -100` masking, runs `Trainer` `save_steps 25` (auto-resume latest `checkpoint-*`)
-6. Pushes `final_adapter` to Hub (`imadityasarkar/satquery-qwen2vl-stage1-bigearthnet` / `imadityasarkar/satquery-phase2-vrsbench` / `imadityasarkar/cdvqa_change`)
+6. Pushes `final_adapter` to Hub (`HARSHITSINGH/satquery-qwen2vl-stage1-bigearthnet` / `HARSHITSINGH/satquery-phase2-vrsbench` / `HARSHITSINGH/cdvqa_change`)
 
 Stage-3 is paired: `processor(text=[prompt], images=[T1,T2])` with change-specific system prompt.
 
@@ -427,7 +427,7 @@ Per-dataset hyperparams live in `training/configs/*.json` (see table above).
 - **Evidence** — `image_ref` / `bounding_box [[x,y]...]` / `overlay` per task
 - **Query Log** — last 20 queries, click to re-run
 
-### HF Space (`https://huggingface.co/spaces/imadityasarkar/satquery-backend`)
+### HF Space (`https://huggingface.co/spaces/HARSHITSINGH/satquery-backend`)
 
 Same `Blocks` in `app.py` with `Refresh health` (cheap by default — no model load, no GPU quota burn) and `chart_state` Bar/Pie toggle identical to React. First click cold-pulls ~4 GB (30–60 s), warm ~1.2 s. Error paths return schema-valid traces so failures render as messages, never a blank crash.
 
@@ -493,9 +493,9 @@ Environment — create `.env` (never commit, see `.gitignore:22`) — all keys r
 ```
 # Model
 SATQUERY_BASE_MODEL=Qwen/Qwen2-VL-2B-Instruct
-SATQUERY_ADAPTER_PATH=imadityasarkar/satquery-phase2-vrsbench
-SATQUERY_CHANGE_ADAPTER_PATH=imadityasarkar/cdvqa_change
-SATQUERY_FUSION_ADAPTER_PATH=imadityasarkar/satquery-phase2-vrsbench
+SATQUERY_ADAPTER_PATH=HARSHITSINGH/satquery-phase2-vrsbench
+SATQUERY_CHANGE_ADAPTER_PATH=HARSHITSINGH/cdvqa_change
+SATQUERY_FUSION_ADAPTER_PATH=HARSHITSINGH/satquery-phase2-vrsbench
 SATQUERY_CHANGE_BASE_MODEL=Qwen/Qwen2-VL-2B-Instruct
 SATQUERY_FUSION_BASE_MODEL=Qwen/Qwen2-VL-2B-Instruct
 HF_TOKEN=hf_...                          # if gated/private
@@ -553,18 +553,18 @@ React + Vite ──HTTPS──► /api/gradio/* ──► POST /gradio_api/uploa
   attach `Authorization: Bearer $HF_TOKEN` server-side so usage bills the owner's
   own quota. The token is never in the browser bundle — never put secrets in `VITE_*`.
   Server env (Vercel → Settings → Environment Variables, all environments):
-  `SATQUERY_SPACE_URL=https://imadityasarkar-satquery-backend.hf.space`, `HF_TOKEN=hf_...`.
+  `SATQUERY_SPACE_URL=https://HARSHITSINGH-satquery-backend.hf.space`, `HF_TOKEN=hf_...`.
   Local `vite dev` has no proxy function, so localhost calls the Space directly (anonymous quota).
 * Frontend (Vercel): Root Directory `frontend`, build `npm install && npm run build`,
   output `dist/`, SPA fallback `frontend/vercel.json` (excludes `/api/*` so function
   routes aren't swallowed). Public var
   `VITE_API_BASE_URL` = local `http://localhost:8000` (FastAPI transport, Vite proxy also works with
-  an empty value), prod `https://imadityasarkar-satquery-backend.hf.space` (selects the Gradio
+  an empty value), prod `https://HARSHITSINGH-satquery-backend.hf.space` (selects the Gradio
   transport; queue calls themselves go through the same-origin proxy).
   Transport auto-detects from the base URL (empty/localhost → FastAPI, anything else → Gradio);
   override with `VITE_API_TRANSPORT=gradio|fastapi`. Every submission opens a fresh queue job
   (`event_id` never reused).
-* Backend (HF Space `imadityasarkar/satquery-backend`, Gradio SDK — required for ZeroGPU): README frontmatter
+* Backend (HF Space `HARSHITSINGH/satquery-backend`, Gradio SDK — required for ZeroGPU): README frontmatter
   `sdk: gradio`, `app_file: app.py`, `hardware: zero-a10g`; `python app.py` → `demo.queue(max_size=20)`
   + `demo.launch`. The client contract (derived from Gradio 5.16.1, no hardcoded guesses):
   `POST /gradio_api/upload` (multipart `files`) → `{path, orig_name, meta: {_type: "gradio.FileData"}}`
@@ -584,7 +584,7 @@ React + Vite ──HTTPS──► /api/gradio/* ──► POST /gradio_api/uploa
 * Push list for the new Space: `README.md`, `app.py`, `requirements.txt`, `backend/`, `docs/`,
   optional `.gitignore` (+ `assets/` if present). Do NOT push `Dockerfile`, `frontend/`,
   `training/`, `tests/`, `data/`, `.env`.
-* EXISTING HF Space (`imadityasarkar/satquery-ai`) remains a separate backup/demo Gradio +
+* EXISTING HF Space (`HARSHITSINGH/satquery-ai`) remains a separate backup/demo Gradio +
   ZeroGPU deployment — DO NOT modify, migrate, or replace it as part of this work. The live
   backend is `satquery-backend`; the live frontend is `https://sat-query-ai-sih-26.vercel.app`.
 
@@ -606,7 +606,7 @@ make build         # vite build → frontend/dist
 - **LoRA / QLoRA** — Hu et al., *LoRA: Low-Rank Adaptation of Large Language Models*, 2021; Dettmers et al., *QLoRA: Efficient Finetuning of Quantized LLMs*, 2023. `r=16 α=32` NF4 4-bit + double quant via `BitsAndBytesConfig` + `peft` on T4.
 - **BigEarthNet** — Sumbul et al., *BigEarthNet: A Large-Scale Benchmark Archive for Remote Sensing Image Understanding*, 2019. Sentinel-2 `120×120` chips, 19 land-cover labels — source for Stage-1 `800` S2 subset.
 - **RSVQA / VRSBench** — Lobry et al., *RSVQA: Visual Question Answering for Remote Sensing Data*, 2020; Li et al., *VRSBench: A Versatile Benchmark for Vision-Language Models in Remote Sensing*, 2023. Grounding `bbox` and VQA `yes/no, count, comparison` for Stage-2.
-- **CDVQA** — Change Detection VQA, bi-temporal `T1→T2` question answering — Stage-3 `cdvqa_change_sft.ipynb` paired loader, `imadityasarkar/cdvqa_change`.
+- **CDVQA** — Change Detection VQA, bi-temporal `T1→T2` question answering — Stage-3 `cdvqa_change_sft.ipynb` paired loader, `HARSHITSINGH/cdvqa_change`.
 - **YOLOv8** — Jocher et al., *Ultralytics YOLOv8*, 2023. `yolov8n.pt` (COCO mAP 37.3, 6 MB) for counting; DOTA OBB weight for RS small objects.
 - **ExecutionTrace** — Graded trace `docs/execution_trace_schema.md` (`backend/schemas` ↔ `frontend/src/types/api.ts`) — compliant traces for hackathon evaluation.
 
