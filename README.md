@@ -26,7 +26,9 @@ license: mit
 
 Smart India Hackathon 2026 — Agentic Vision-Language Intelligence for Earth Observation
 
-[🚀 Live App](https://sat-query-ai-sih-26.vercel.app) · [🛰️ Live Space](https://huggingface.co/spaces/HARSHITSINGH/satquery-ai) · [📓 Training Notebook](https://colab.research.google.com/github/awdtyo/SatQueryAI-SIH26/blob/main/training/notebooks/satquery_ai_qlora_finetune.ipynb) · [📝 Execution Trace](docs/execution_trace_schema.md)
+[🚀 Live App](https://sat-query-ai-sih-26.vercel.app) · [🛰️ Live Space](https://huggingface.co/spaces/HARSHITSINGH/satquery-ai) · [📓 Training Notebook](
+
+) · [📝 Execution Trace](docs/execution_trace_schema.md)
 
 </div>
 
