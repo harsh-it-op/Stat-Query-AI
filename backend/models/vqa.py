@@ -1,0 +1,753 @@
+"""
+VQA / Captioning specialist wrapper — real inference with Qwen2-VL-2B + QLoRA.
+
+Benchmarks: RSVQA, VRSBench (captioning/VQA). Stage 1 adapter trained on
+BigEarthNet Sentinel-2 image-caption pairs (see training/notebooks/).
+
+Interface (shared contract — high-stakes, do not change signature):
+    predict(images, query, task) -> {"answer": str, "evidence": list[dict], "confidence": float}
+
+- images: PIL.Image.Image | list[PIL.Image.Image] | str (path) | bytes
+- query: natural language question/caption prompt
+- task: "vqa" | "captioning" | "visual_question_answering" (affects evidence labeling)
+
+Model is loaded ONCE at server startup as a module-level singleton. Per-request
+loading would be unusably slow and OOM under load.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+from pathlib import Path
+from typing import Any
+
+from PIL import Image
+
+# torch is optional at import time — CI may not have it; inference will fail
+# gracefully with a clear error if predict() is called without torch.
+try:
+    import torch  # type: ignore
+except ImportError:  # pragma: no cover - CI without GPU
+    torch = None  # type: ignore
+
+from backend import config as app_config
+
+logger = logging.getLogger(__name__)
+
+# Singleton state
+_model = None  # Qwen2VLForConditionalGeneration + PeftModel
+_processor = None  # AutoProcessor
+_load_error: str | None = None
+_load_attempted: bool = False
+_is_real: bool = False  # True if adapter actually loaded, False if stub/degraded
+
+# Generation defaults — detailed outputs
+_MAX_NEW_TOKENS = app_config.MAX_NEW_TOKENS
+_MIN_NEW_TOKENS = app_config.MIN_NEW_TOKENS
+_TEMPERATURE = app_config.TEMPERATURE
+_TOP_P = app_config.TOP_P
+_REPETITION_PENALTY = app_config.REPETITION_PENALTY
+_NO_REPEAT_NGRAM_SIZE = app_config.NO_REPEAT_NGRAM_SIZE
+_SYSTEM_PROMPT = app_config.SYSTEM_PROMPT
+_DETAIL_SUFFIX = app_config.DETAIL_SUFFIX
+
+# Coarse 3x3 spatial heuristic only; this is not pixel-precise grounding.
+GRID_LABELS: dict[tuple[int, int], str] = {
+    (0, 0): "northwest",
+    (0, 1): "north",
+    (0, 2): "northeast",
+    (1, 0): "west",
+    (1, 1): "center",
+    (1, 2): "east",
+    (2, 0): "southwest",
+    (2, 1): "south",
+    (2, 2): "southeast",
+}
+
+# Recorded verbatim in the execution trace — do not rename.
+SPATIAL_METHOD = "coarse_3x3_grid_heuristic"
+
+# Minimum share of a grid cell a class must hold to count as spatial evidence.
+_GRID_MIN_CELL_SHARE = 0.40
+
+
+def _get_compute_dtype():  # type: ignore[no-untyped-def]
+    """T4 (sm_75) is fp16-optimal; bf16 is emulated/slow. Always use fp16 for inference unless A100+."""
+    if torch is None:
+        return None
+    # We intentionally keep fp16 even when bf16 is available — matches training notebook.
+    return torch.float16
+
+
+def _is_gpu_available() -> bool:
+    """Centralized GPU check — respects FORCE_CPU. VLM runs on GPU whenever available."""
+    if getattr(app_config, "FORCE_CPU", False):
+        return False
+    # Prefer config helper if available (keeps single source of truth)
+    if hasattr(app_config, "is_gpu_available"):
+        try:
+            return bool(app_config.is_gpu_available())
+        except Exception:
+            pass
+    return bool(torch is not None and torch.cuda.is_available())
+
+
+def _device_string() -> str:
+    return "cuda" if _is_gpu_available() else "cpu"
+
+
+def _load_model() -> bool:
+    """Load base 4-bit quantized + adapter once. Returns True if real model ready."""
+    global _model, _processor, _load_error, _load_attempted, _is_real
+    if _load_attempted:
+        return _is_real
+    _load_attempted = True
+
+    base_id = app_config.BASE_MODEL
+    adapter_id = app_config.ADAPTER_PATH
+    hf_token = app_config.HF_TOKEN
+
+    logger.info("VQA specialist: loading base=%s adapter=%s", base_id, adapter_id)
+
+    try:
+        from transformers import AutoProcessor, BitsAndBytesConfig, Qwen2VLForConditionalGeneration
+        from peft import PeftModel
+
+        # Processor — always succeeds (small download)
+        try:
+            _processor = AutoProcessor.from_pretrained(
+                base_id,
+                min_pixels=app_config.IMAGE_MIN_PIXELS,
+                max_pixels=app_config.IMAGE_MAX_PIXELS,
+                trust_remote_code=True,
+                token=hf_token,
+            )
+        except Exception as e:
+            # Fallback without min/max if processor doesn't support it
+            logger.warning("VQA processor load with min/max pixels failed (%s), retrying plain", e)
+            _processor = AutoProcessor.from_pretrained(
+                base_id, trust_remote_code=True, token=hf_token
+            )
+
+        # Determine quantization strategy — GPU whenever available (respects FORCE_CPU)
+        has_cuda = _is_gpu_available()
+        raw_has_cuda = bool(torch is not None and torch.cuda.is_available())
+        if not has_cuda and raw_has_cuda and getattr(app_config, "FORCE_CPU", False):
+            logger.info("VQA: FORCE_CPU=1 — ignoring available CUDA, running on CPU only")
+        # Log effective device choice for transparency
+        if has_cuda:
+            try:
+                gpu_name = torch.cuda.get_device_name(0) if torch is not None else "cuda"
+                gpu_count = torch.cuda.device_count() if torch is not None else 1
+                logger.info("VQA: GPU detected — %s (count=%d), will load on GPU", gpu_name, gpu_count)
+            except Exception:
+                logger.info("VQA: GPU detected — will load on GPU")
+        else:
+            logger.info("VQA: no GPU available or FORCE_CPU set — loading on CPU")
+
+        has_bnb = True
+        try:
+            import bitsandbytes  # noqa: F401
+        except Exception:
+            has_bnb = False
+        # FORCE_CPU also disables 4-bit even if bitsandbytes present
+        if getattr(app_config, "FORCE_CPU", False):
+            has_bnb = False
+
+        # device_map: auto delegates to GPU when available, cpu forces CPU-only
+        if not has_cuda:
+            device_map_value: Any = "cpu"
+        else:
+            device_map_value = "auto"
+        model_kwargs: dict[str, Any] = {
+            "trust_remote_code": True,
+            "device_map": device_map_value,
+            "token": hf_token,
+        }
+        # Helpful for large CPU load — allow low-mem and offload to /tmp if still needed
+        if not has_cuda:
+            model_kwargs["low_cpu_mem_usage"] = True
+
+        if has_cuda and has_bnb:
+            compute_dtype = _get_compute_dtype()
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+            model_kwargs["quantization_config"] = bnb_config
+            logger.info("VQA: using 4-bit NF4 + double_quant on GPU (compute=%s)", compute_dtype)
+        elif has_cuda and not has_bnb:
+            logger.warning("VQA: GPU available but bitsandbytes not installed — loading on GPU without 4-bit quant (fp16)")
+            model_kwargs["torch_dtype"] = _get_compute_dtype()
+        else:
+            # CPU fallback
+            logger.warning("VQA: loading on CPU without 4-bit quant (fp16) — no CUDA" if not has_cuda else "VQA: loading without 4-bit quant")
+            model_kwargs["torch_dtype"] = _get_compute_dtype()
+
+        base_model = Qwen2VLForConditionalGeneration.from_pretrained(base_id, **model_kwargs)
+
+        # Attach LoRA adapter — works for Hub id or local path transparently
+        # CPU-only large model needs offload folder for accelerate dispatch (15GB RAM tight for 2B)
+        try:
+            import tempfile, os
+
+            offload_kwargs = {}
+            if not has_cuda:
+                tmp_offload = "/tmp/satquery_offload"
+                os.makedirs(tmp_offload, exist_ok=True)
+                offload_kwargs = {"offload_folder": tmp_offload}
+            _model = PeftModel.from_pretrained(base_model, adapter_id, token=hf_token, **offload_kwargs)
+            # Merge is optional for inference; keep adapter separate for clarity
+            _is_real = True
+            logger.info("VQA: adapter loaded successfully from %s", adapter_id)
+        except Exception as e:
+            # Adapter failed (auth, network, path, OOM) — degrade gracefully
+            # Keep base model as fallback? Per AGENTS.md we must not bypass RS adaptation
+            # with a generic fallback, so we mark degraded and raise at predict time.
+            # But keep base_model so health check can report the error clearly.
+            logger.error("VQA: adapter load failed from %s: %s", adapter_id, e, exc_info=True)
+            _load_error = f"Adapter load failed ({adapter_id}): {e}"
+            # Keep degraded: do not set _model to base alone — would bypass adaptation
+            _model = None
+            _is_real = False
+            return False
+
+        _model.eval()
+        _is_real = True
+        _load_error = None
+        # Ensure tensors on correct device — GPU whenever available
+        if not has_cuda:
+            try:
+                _model = _model.to("cpu")  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        else:
+            # If model landed on CPU despite GPU available (e.g. accelerate fallback), move to GPU
+            try:
+                # PeftModel wraps base; .to("cuda") will dispatch if needed
+                if hasattr(_model, "device") and str(_model.device) == "cpu":
+                    _model = _model.to("cuda")  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        if has_cuda and torch is not None:
+            try:
+                logger.info(
+                    "VQA specialist READY — GPU=%s mem=%.1fGB device_map=%s",
+                    torch.cuda.get_device_name(0),
+                    torch.cuda.memory_allocated() / 1024**3,
+                    device_map_value,
+                )
+            except Exception:
+                logger.info("VQA specialist READY — GPU available, device_map=%s", device_map_value)
+        else:
+            mode = "CPU-ONLY (forced)" if getattr(app_config, "FORCE_CPU", False) else "CPU mode (no CUDA)"
+            logger.info("VQA specialist READY — %s device_map=%s", mode, device_map_value)
+        return True
+
+    except Exception as e:
+        logger.error("VQA: base model load failed (%s): %s", base_id, e, exc_info=True)
+        _load_error = f"Base model load failed ({base_id}): {e}"
+        _model = None
+        _processor = None
+        _is_real = False
+        return False
+
+
+def _ensure_loaded() -> None:
+    if torch is None:
+        raise RuntimeError(
+            _load_error or "torch not installed — cannot run VQA inference. Install torch to use real adapter."
+        )
+    if not _load_attempted:
+        _load_model()
+    if not _is_real or _model is None or _processor is None:
+        raise RuntimeError(
+            _load_error or "VQA specialist not loaded — adapter unavailable. "
+            "Backend is in degraded/stub mode. Check ADAPTER_PATH / HF_TOKEN / GPU memory."
+        )
+
+
+def _coerce_images(images: Any) -> list[Image.Image]:
+    """Normalize various image input forms to list[PIL.Image]."""
+    if images is None:
+        raise ValueError("No images provided to VQA specialist")
+
+    # Single item -> list
+    if isinstance(images, (str, Path)):
+        # Path string
+        return [Image.open(str(images)).convert("RGB")]
+    if isinstance(images, Image.Image):
+        return [images.convert("RGB")]
+    if isinstance(images, (bytes, bytearray)):
+        import io
+
+        return [Image.open(io.BytesIO(images)).convert("RGB")]
+
+    # List/tuple
+    if isinstance(images, (list, tuple)):
+        out: list[Image.Image] = []
+        for idx, item in enumerate(images):
+            if isinstance(item, Image.Image):
+                out.append(item.convert("RGB"))
+            elif isinstance(item, (str, Path)):
+                out.append(Image.open(str(item)).convert("RGB"))
+            elif isinstance(item, (bytes, bytearray)):
+                import io
+
+                out.append(Image.open(io.BytesIO(item)).convert("RGB"))
+            elif isinstance(item, dict) and "image" in item:
+                # e.g. {"image": PIL.Image}
+                img = item["image"]
+                if isinstance(img, Image.Image):
+                    out.append(img.convert("RGB"))
+                else:
+                    raise ValueError(f"Unsupported image dict entry at index {idx}: {type(img)}")
+            else:
+                raise ValueError(f"Unsupported image type at index {idx}: {type(item)}")
+        if not out:
+            raise ValueError("Empty image list provided")
+        return out
+
+    raise ValueError(f"Unsupported images type: {type(images)}")
+
+
+def _compute_grounding(
+    image: Image.Image,
+) -> tuple[list[dict[str, Any]], dict[str, float], list[dict[str, Any]]]:
+    """Compute class coverage + coarse 3x3 grid ONCE per request.
+
+    backend.utils.chart is the single source of truth: the same pixel classifier
+    produces the chart percentages, the coverage dict fed into the VQA prompt,
+    and the spatial grid recorded in the execution trace.
+
+    Returns (chart, coverage_percentages, spatial_grid) — all JSON serializable.
+    """
+    chart: list[dict[str, Any]] = []
+    coverage: dict[str, float] = {}
+    grid: list[dict[str, Any]] = []
+
+    if getattr(app_config, "CHART_ENABLED", True):
+        try:
+            from backend.utils.chart import compute_chart, compute_grid  # type: ignore
+
+            source = getattr(app_config, "CHART_SOURCE", "heuristic")
+            if source in ("heuristic", "auto"):
+                chart = compute_chart(image)
+                # Fallback if heuristic fails (uniform image) — placeholder, not grounded
+                if not chart:
+                    chart = [{"label": "coverage", "value": 100.0}]
+                # Grounded coverage = measured class labels only (never the placeholder)
+                grounded = [e for e in chart if isinstance(e, dict) and str(e.get("label", "")) != "coverage"]
+                coverage = {str(e["label"]): float(e["value"]) for e in grounded}
+                if coverage:
+                    try:
+                        grid = [
+                            {
+                                "feature": str(cell["label"]),
+                                "location": GRID_LABELS[(int(cell["row"]), int(cell["col"]))],
+                                "row": int(cell["row"]),
+                                "col": int(cell["col"]),
+                                "cell_percent": float(cell["cell_percent"]),
+                                "image_percent": float(cell["image_percent"]),
+                            }
+                            for cell in compute_grid(image, min_cell_share=_GRID_MIN_CELL_SHARE)
+                            if (int(cell["row"]), int(cell["col"])) in GRID_LABELS
+                        ]
+                    except Exception as e:
+                        logger.warning("Coarse 3x3 grid failed: %s", e)
+                        grid = []
+            else:
+                chart = []
+        except Exception as e:
+            logger.warning("Heuristic chart failed: %s", e)
+            chart = [{"label": "coverage", "value": 100.0}]
+    else:
+        chart = []
+
+    return chart, coverage, grid
+
+
+def _grounding_context(coverage: dict[str, float], grid: list[dict[str, Any]]) -> str:
+    """Prompt block carrying measured coverage percentages + coarse grid evidence.
+
+    Percentages come straight from the chart computation — never invented here.
+    If no grounded percentage is available the model is told to state none.
+    """
+    lines = ["", "[Grounded evidence — measured from pixels, not estimated by you]"]
+    lines.append("Class coverage (percent of image area):")
+    if coverage:
+        lines.extend(f"- {label}: {value:.1f}%" for label, value in coverage.items())
+    else:
+        lines.append("- none available for this image")
+
+    lines.append("Coarse 3x3 spatial grid (heuristic — coarse locations only):")
+    if grid:
+        per_feature: dict[str, list[str]] = {}
+        for cell in grid:
+            per_feature.setdefault(str(cell["feature"]), []).append(str(cell["location"]))
+        lines.extend(f"- {feat}: {', '.join(locs)}" for feat, locs in per_feature.items())
+    else:
+        lines.append("- no reliable spatial evidence for this image")
+
+    lines.extend(
+        [
+            "Instructions for using this evidence:",
+            "- For each feature you describe, include its approximate area coverage using the "
+            "provided percentage. Do not invent, recompute, or guess a percentage. Use only the "
+            "grounded percentage supplied in the context.",
+            "- If no grounded percentage is supplied for a feature, do not state a percentage for it.",
+            "- Mention a spatial location only when it is supported by the supplied grid evidence "
+            "above. These are coarse 3x3 grid cells only — not pixel-precise grounding; do not "
+            "claim finer precision than a quadrant.",
+            '- Style: "<Feature> is concentrated in the <location> quadrant, covering '
+            'approximately <grounded percentage>% of the image."',
+        ]
+    )
+    return "\n" + "\n".join(lines)
+
+
+def predict(
+    images: Any,
+    query: str,
+    task: str = "vqa",
+) -> dict[str, Any]:
+    """Shared inference interface — see module docstring.
+
+    Returns: {"answer": str, "evidence": list[dict], "confidence": float}
+
+    Evidence is minimal for stage 1 (echoes input). Confidence is derived from
+    length-normalized log-probs when the model exposes scores, otherwise falls
+    back to a heuristic.
+
+    This function is thread-safe for concurrent FastAPI requests because the
+    underlying model is read-only after load (no gradient). GPU memory is shared.
+    """
+    start_ms = time.time()
+
+    _ensure_loaded()
+    assert _model is not None and _processor is not None
+
+    if not query or not query.strip():
+        raise ValueError("Empty query provided to VQA specialist")
+
+    pil_images = _coerce_images(images)
+    # Stage 1 is single-image only — use first image, warn if more
+    if len(pil_images) > 1:
+        logger.warning("VQA: received %d images for task=%s, using first only (stage 1 single-image)", len(pil_images), task)
+
+    image = pil_images[0]
+
+    # Grounded coverage + coarse spatial grid — measured once from pixels, reused by
+    # the chart output, the grounding context below, and the execution trace.
+    chart, coverage_percentages, spatial_grid = _compute_grounding(image)
+
+    # Build Qwen2-VL chat messages — detailed analyst persona via system prompt
+    # Task-aware: grounding/change keep concise, vqa/captioning gets detailed suffix
+    q_raw = query.strip()
+    # Append detail suffix for very short generic queries to elicit percentages/locations
+    if len(q_raw.split()) <= 6 and task in ("vqa", "captioning", "visual_question_answering"):
+        q_raw = q_raw + _DETAIL_SUFFIX
+    # Query-specificity guard: force the VLM to answer THIS question, not a generic caption.
+    # Applied to every request (not just short ones) — generic drift was observed on full questions too.
+    _directive = getattr(app_config, "QUERY_DIRECTIVE", None) or (
+        "Answer the following question specifically and directly — do not give a "
+        "generic image caption. Question: {question}"
+    )
+    try:
+        q_text = _directive.format(question=q_raw)
+    except Exception:
+        q_text = q_raw
+    # Grounded coverage percentages + coarse 3x3 spatial evidence for the model
+    q_text = q_text + _grounding_context(coverage_percentages, spatial_grid)
+    messages: list[dict[str, Any]] = []
+    if _SYSTEM_PROMPT:
+        messages.append({"role": "system", "content": [{"type": "text", "text": _SYSTEM_PROMPT}]})
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": q_text},
+            ],
+        }
+    )
+
+    try:
+        prompt_text = _processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = _processor(text=[prompt_text], images=[image], return_tensors="pt", padding=True)
+
+        # Move to model device — GPU whenever available
+        assert torch is not None
+        # Resolve target device: prefer actual model device, else GPU if available, else CPU
+        try:
+            if hasattr(_model, "device"):
+                model_device = _model.device  # type: ignore[attr-defined]
+            else:
+                # Peek first parameter device; handles device_map="auto" sharding
+                model_device = next(_model.parameters()).device  # type: ignore[attr-defined]
+        except Exception:
+            model_device = torch.device("cuda" if _is_gpu_available() else "cpu")
+        # Fallback if model reports cpu but GPU is available (e.g. CPU-only load on GPU machine)
+        if _is_gpu_available() and str(model_device) == "cpu":
+            # Keep cpu model on cpu to avoid OOM copy, but inputs should go where model is
+            # If model is on cpu due to FORCE_CPU, inputs stay cpu; otherwise try cuda
+            if not getattr(app_config, "FORCE_CPU", False):
+                try:
+                    # Verify we can move to cuda
+                    model_device = torch.device("cuda")
+                except Exception:
+                    pass
+        # Move tensors to target device
+        for k, v in list(inputs.items()):
+            if isinstance(v, torch.Tensor):
+                try:
+                    inputs[k] = v.to(model_device)
+                except Exception:
+                    # Fallback: try cuda explicitly if auto failed
+                    if _is_gpu_available():
+                        try:
+                            inputs[k] = v.to("cuda")
+                        except Exception:
+                            inputs[k] = v.to("cpu")
+                    else:
+                        inputs[k] = v.to("cpu")
+
+        # Generate — request scores for logprob-based confidence when available
+        with torch.no_grad():
+            # Qwen2-VL may need image_grid_thw handling — processor already sets it
+            input_len = int(inputs["input_ids"].shape[1])
+            scores = None
+            gen_ids = None
+            # Try to get scores; fall back to plain generate for mocked tests / old transformers
+            # Detailed outputs: sampling enabled when temperature>0, with repetition controls
+            do_sample = _TEMPERATURE > 0
+            try:
+                outputs = _model.generate(
+                    **inputs,
+                    max_new_tokens=_MAX_NEW_TOKENS,
+                    min_new_tokens=_MIN_NEW_TOKENS if _MIN_NEW_TOKENS > 0 else None,
+                    do_sample=do_sample,
+                    temperature=_TEMPERATURE if do_sample else None,
+                    top_p=_TOP_P if do_sample else None,
+                    repetition_penalty=_REPETITION_PENALTY,
+                    no_repeat_ngram_size=_NO_REPEAT_NGRAM_SIZE,
+                    output_scores=True,
+                    return_dict_in_generate=True,
+                )
+                # HuggingFace GenerateOutput has .sequences and .scores
+                if hasattr(outputs, "sequences"):
+                    gen_ids = outputs.sequences
+                    scores = getattr(outputs, "scores", None)
+                elif isinstance(outputs, tuple) and len(outputs) == 2:
+                    gen_ids, scores = outputs  # type: ignore
+                else:
+                    gen_ids = outputs  # type: ignore
+            except TypeError:
+                # Older transformers or mocked generate that doesn't accept those kwargs
+                gen_ids = _model.generate(
+                    **inputs,
+                    max_new_tokens=_MAX_NEW_TOKENS,
+                    do_sample=do_sample,
+                    temperature=_TEMPERATURE if do_sample else 0.0,
+                    top_p=_TOP_P if do_sample else None,
+                )
+                scores = None
+            # Normalize gen_ids to tensor-like with shape [batch, seq_len]
+            if gen_ids is None:
+                raise RuntimeError("VQA generate returned no ids")
+            # Trim prompt — handle both torch.Tensor and mocked _SimpleTensor
+            try:
+                seq_len = int(gen_ids.shape[1])  # type: ignore
+            except Exception:
+                seq_len = len(gen_ids[0]) if hasattr(gen_ids, "__getitem__") else 0  # type: ignore
+            # Slice generated tokens
+            try:
+                gen_trimmed = gen_ids[0][input_len:]  # type: ignore
+            except Exception:
+                # Fallback for unexpected tensor types
+                gen_trimmed = gen_ids[0][input_len:]  # type: ignore
+            answer = _processor.decode(gen_trimmed, skip_special_tokens=True).strip()
+
+            if not answer:
+                answer = "(no answer generated)"
+                confidence = 0.3
+            else:
+                confidence = None
+                # Logprob-based confidence when scores are available
+                if scores is not None:
+                    try:
+                        import torch.nn.functional as F  # type: ignore
+
+                        log_probs: list[float] = []
+                        # scores is tuple of [batch, vocab] per generated token
+                        for idx, logit in enumerate(scores):  # type: ignore
+                            if not hasattr(logit, "shape"):
+                                continue
+                            # log_softmax over vocab
+                            try:
+                                lp_dist = F.log_softmax(logit, dim=-1)  # type: ignore
+                            except Exception:
+                                continue
+                            # token id for this step
+                            try:
+                                tok_tensor = gen_ids[0][input_len + idx]  # type: ignore
+                                # tok_tensor may be int or 0-d tensor
+                                tok = int(tok_tensor.item()) if hasattr(tok_tensor, "item") else int(tok_tensor)  # type: ignore
+                            except Exception:
+                                continue
+                            try:
+                                # lp_dist shape [batch, vocab] or [vocab]
+                                if hasattr(lp_dist, "dim") and lp_dist.dim() == 2:  # type: ignore
+                                    lp = float(lp_dist[0, tok].item())  # type: ignore
+                                else:
+                                    lp = float(lp_dist[tok].item())  # type: ignore
+                                log_probs.append(lp)
+                            except Exception:
+                                continue
+                        if log_probs:
+                            mean_lp = sum(log_probs) / len(log_probs)
+                            base_prob = math.exp(mean_lp)  # geometric mean prob in (0,1]
+                            # Map to calibrated confidence: 0.35 + 0.6*prob, with apology penalty
+                            conf = 0.35 + 0.6 * float(base_prob)
+                            if "I cannot" in answer or "sorry" in answer.lower():
+                                conf = min(conf, 0.35)
+                            confidence = max(0.1, min(0.95, conf))
+                    except Exception as e:
+                        logger.debug("Logprob confidence failed, falling back to heuristic: %s", e)
+                        confidence = None
+                if confidence is None:
+                    # Heuristic fallback (covers mocked tests where scores is None)
+                    base = 0.72
+                    if len(answer.split()) > 12:
+                        base += 0.08
+                    if "I cannot" in answer or "sorry" in answer.lower():
+                        base = 0.35
+                    confidence = min(0.95, max(0.1, base))
+
+    except Exception as e:
+        logger.error("VQA predict failed (query=%r): %s", query[:80], e, exc_info=True)
+        raise RuntimeError(f"VQA inference failed: {e}") from e
+
+    latency_ms = int((time.time() - start_ms) * 1000)
+
+    # --- Parse bullets from markdown (bullets replace paragraph) — chart is heuristic ---
+    import re
+
+    bullets: list[str] = []
+    # Extract markdown bullets "- **Class** ..." or "•"
+    for line in answer.splitlines():
+        s = line.strip()
+        if s.startswith("- ") or s.startswith("• ") or s.startswith("* "):
+            bullets.append(s[2:].strip()[:180])
+    if not bullets and "•" in answer:
+        bullets = [b.strip()[:180] for b in answer.split("•") if b.strip()][:6]
+    # Remove any stray JSON fence the model may still emit (chart is heuristic now)
+    if "```json" in answer:
+        answer = re.sub(r"```json\s*\{.*?\}\s*```", "", answer, flags=re.DOTALL).strip()
+    if not bullets and answer.strip():
+        # Split answer sentences into bullets if model ignored format
+        sents = re.split(r"(?<=[.!?])\s+", answer.strip())
+        bullets = [s.strip()[:180] for s in sents if s.strip()][:6]
+        if bullets:
+            answer = "\n".join(f"- {b}" for b in bullets)
+    else:
+        # Rebuild answer as clean bullet markdown
+        if bullets:
+            answer = "\n".join(f"- {b}" for b in bullets)
+
+    # Minimal evidence for stage 1 — echo input
+    evidence = [
+        {
+            "type": "image_ref",
+            "description": f"Input image for task={task}",
+            "image_index": 0,
+        }
+    ]
+
+    logger.info("VQA predict done: task=%s latency=%dms answer_len=%d bullets=%d chart=%d", task, latency_ms, len(answer), len(bullets), len(chart))
+
+    return {
+        "answer": answer,
+        "evidence": evidence,
+        "confidence": float(confidence),
+        "_latency_ms": latency_ms,  # internal, stripped by controller if needed
+        "_structured": {"bullets": bullets, "chart": chart, "chart_type": "distribution"},
+        "_chart": chart,
+        "_chart_type": "distribution",
+        # Grounded coverage + coarse spatial context for the execution trace
+        "_coverage_percentages": coverage_percentages,
+        "_spatial_grid": spatial_grid,
+        "_spatial_method": SPATIAL_METHOD,
+    }
+
+
+# Public helpers for registry/startup check
+def is_real() -> bool:
+    """Whether the real adapter is loaded (vs degraded/stub)."""
+    if not _load_attempted:
+        _load_model()
+    return _is_real
+
+
+def load_error() -> str | None:
+    """Human-readable load error if degraded, else None."""
+    if not _load_attempted:
+        _load_model()
+    return _load_error
+
+
+def get_model_info() -> dict[str, Any]:
+    """For /health and startup logging."""
+    if not _load_attempted:
+        _load_model()
+    raw_has_cuda = bool(torch is not None and torch.cuda.is_available())
+    has_cuda = _is_gpu_available()
+    effective_has_cuda = has_cuda  # respects FORCE_CPU, actual dispatch
+    try:
+        device = str(next(_model.parameters()).device) if _model is not None and hasattr(_model, "parameters") else "unloaded"
+        if hasattr(_model, "device"):
+            try:
+                device = str(_model.device)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+    except Exception:
+        device = "unloaded"
+    # Surface forced CPU so health badge can render correctly
+    if getattr(app_config, "FORCE_CPU", False):
+        device = "cpu"
+        has_cuda = False
+    # Add GPU details when available
+    gpu_name = None
+    gpu_count = 0
+    if raw_has_cuda and torch is not None:
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_count = int(torch.cuda.device_count())
+        except Exception:
+            pass
+    return {
+        "base_model": app_config.BASE_MODEL,
+        "adapter_path": app_config.ADAPTER_PATH,
+        "is_real": _is_real,
+        "load_error": _load_error,
+        "device": device,
+        "has_cuda": raw_has_cuda,
+        "has_cuda_effective": effective_has_cuda,
+        "force_cpu": getattr(app_config, "FORCE_CPU", False),
+        "compute": "cpu-only" if getattr(app_config, "FORCE_CPU", False) else ("cuda" if effective_has_cuda else "cpu"),
+        "gpu_name": gpu_name,
+        "gpu_count": gpu_count,
+        "compute_dtype": str(_get_compute_dtype()) if torch is not None else None,
+    }
+
+
+def preload() -> bool:
+    """Explicit preload for app startup — returns is_real."""
+    return _load_model()
+
+
+__all__ = ["predict", "is_real", "load_error", "get_model_info", "preload"]
