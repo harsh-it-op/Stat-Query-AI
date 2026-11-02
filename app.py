@@ -1,0 +1,791 @@
+"""Gradio + ZeroGPU entry for HF Spaces — keeps Docker local CPU intact.
+
+- Gradio SDK (sdk: gradio, hardware: zero-a10g) runs this file as `app.py` on 7860.
+- Docker local (`Dockerfile`, `SATQUERY_FORCE_CPU=1`) is untouched — `make pitch-demo` still works.
+- Reuses backend/controller + registry + specialist contracts (no HTTP, direct controller.handle).
+- Model is loaded at module scope on CUDA (ZeroGPU emulation outside @spaces.GPU, real CUDA inside decorated handler).
+- Frontend 3-zone React is replaced by gr.Blocks for Spaces; local React (5173) stays for dev.
+
+Usage locally (no ZeroGPU hardware, decorator is no-op):
+    python app.py  # opens http://localhost:7860
+
+On HF Spaces ZeroGPU:
+    sdk: gradio + hardware: zero-a10g + @spaces.GPU does the scheduling.
+"""
+
+from __future__ import annotations
+
+# spaces must be imported before torch (backend) so ZeroGPU can patch CUDA
+try:
+    import spaces  # type: ignore  # pip: spaces — not in requirements.txt, provided by HF Gradio image
+except ImportError:  # local dev without spaces package — no-op decorator
+    class _SpacesStub:
+        def GPU(self, *args, **kwargs):  # type: ignore
+            def deco(fn):
+                return fn
+
+            # Support both @spaces.GPU and @spaces.GPU(duration=30)
+            if args and callable(args[0]) and not kwargs:
+                return args[0]
+            return deco
+
+    spaces = _SpacesStub()  # type: ignore
+
+import io
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+import gradio as gr
+from PIL import Image
+
+# --- Patch gradio_client bool schema bug (HF Spaces: TypeError: argument of type 'bool' is not iterable) ---
+# gradio JSON schema may emit "additionalProperties": false (bool). gradio_client 1.7.0's
+# utils.get_type / _json_schema_to_python_type assumes dict and crashes in get_api_info().
+# We monkey-patch before any Blocks are built so /api/info no longer 500s.
+try:
+    import gradio_client.utils as _gcu  # type: ignore
+
+    _orig_get_type = _gcu.get_type
+
+    def _safe_get_type(schema):  # type: ignore[no-untyped-def]
+        if isinstance(schema, bool):
+            return "bool" if schema else "Any"
+        if not isinstance(schema, dict):
+            return {}
+        return _orig_get_type(schema)
+
+    _gcu.get_type = _safe_get_type  # type: ignore[method-assign]
+
+    _orig_json = _gcu._json_schema_to_python_type
+
+    def _safe_json(schema, defs=None):  # type: ignore[no-untyped-def]
+        if isinstance(schema, bool):
+            return "bool" if schema else "Any"
+        return _orig_json(schema, defs)
+
+    _gcu._json_schema_to_python_type = _safe_json  # type: ignore[method-assign]
+except Exception:
+    pass
+
+from backend import config as app_config
+from backend.controller import handle as controller_handle
+from backend import registry
+
+logger = logging.getLogger("satquery.gradio")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+# Keep backend's CPU flag for Docker, but ZeroGPU needs GPU — override via env at Space runtime
+# Space Variables should set SATQUERY_FORCE_CPU=0 (Docker local keeps 1 via Dockerfile:22)
+# Also auto-detect ZeroGPU via SPACES_ZERO_GPU env (HF sets on zero-a10g)
+if os.getenv("SPACES_ZERO_GPU") == "1":
+    # On ZeroGPU, force GPU unless user explicitly set SATQUERY_FORCE_CPU=1
+    if "SATQUERY_FORCE_CPU" not in os.environ:
+        os.environ["SATQUERY_FORCE_CPU"] = "0"
+        # Patch already-imported config and reset cached specialist loads so next predict loads on real CUDA
+        # Both VQA and change (bi-temporal) must be reset — otherwise CPU-cached _load_attempted blocks GPU load inside @spaces.GPU worker
+        try:
+            app_config.FORCE_CPU = False  # type: ignore
+            import backend.models.vqa as _vqa
+
+            _vqa._load_attempted = False  # type: ignore
+            _vqa._is_real = False  # type: ignore
+            _vqa._load_error = None  # type: ignore
+            import backend.models.change as _change
+
+            _change._load_attempted = False  # type: ignore
+            _change._is_real = False  # type: ignore
+            _change._load_error = None  # type: ignore
+            import backend.models.fusion as _fusion
+
+            _fusion._load_attempted = False  # type: ignore
+            _fusion._is_real = False  # type: ignore
+            _fusion._load_error = None  # type: ignore
+            # Also reset processor cache so tokenizer reloads on GPU worker if needed
+            _change._processor = None  # type: ignore
+            _vqa._processor = None  # type: ignore
+            _fusion._processor = None  # type: ignore
+        except Exception:
+            pass
+
+if os.getenv("SATQUERY_FORCE_CPU", "0").lower() in ("0", "false", "off", "no", ""):
+    logger.info("Gradio Space: SATQUERY_FORCE_CPU=0 — ZeroGPU CUDA enabled")
+else:
+    logger.warning("Gradio Space: SATQUERY_FORCE_CPU still 1 — set Space Variable SATQUERY_FORCE_CPU=0 for ZeroGPU, else model stays on CPU")
+
+# Warm registry health at startup — but NOT on ZeroGPU outside GPU worker (would cache CPU model)
+# On ZeroGPU, health outside GPU would load model on emulated CUDA and cache as CPU, breaking real GPU fork
+# Only skip when HF actually signals ZeroGPU; FORCE_CPU=0 alone (local dev default) should still warm health
+_is_zerogpu = os.getenv("SPACES_ZERO_GPU") == "1"
+if not _is_zerogpu:
+    try:
+        h = registry.health()
+        logger.info("Gradio startup health: %s", json.dumps({k: v.get("is_real") for k, v in h.get("registry", {}).items()}))
+    except Exception as e:
+        logger.warning("Gradio startup health failed: %s", e)
+else:
+    logger.info("Gradio startup health: deferred (ZeroGPU — will load on first @spaces.GPU call)")
+
+
+def _pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return buf.getvalue()
+
+
+def _coerce_gradio_image(img: Any, filename: str | None = None) -> tuple[str | None, bytes] | Image.Image:
+    """Gradio gr.Image(type='pil') gives PIL.Image; gr.File gives dict/filepath.
+    Return a (filename, bytes) tuple for controller (filename preserves extension for validation)
+    or PIL.Image directly (controller also accepts PIL).
+    """
+    if img is None:
+        raise ValueError("No image provided")
+    if isinstance(img, Image.Image):
+        return img
+    if isinstance(img, dict) and "name" in img:
+        # gr.File returns {'name': '/tmp/...', 'orig_name': '...', 'size': ...} in some gradio versions
+        # or filepath string
+        path = img.get("name") or img.get("path") or img.get("orig_name")
+        if path and Path(path).exists():
+            data = Path(path).read_bytes()
+            fname = img.get("orig_name") or Path(path).name
+            return (fname, data)
+        raise ValueError(f"Cannot read image dict: {img}")
+    if isinstance(img, str) and Path(img).exists():
+        # filepath
+        return (Path(img).name, Path(img).read_bytes())
+    if isinstance(img, (bytes, bytearray)):
+        return (filename or "upload.png", bytes(img))
+    # numpy array from gr.Image(type='numpy')
+    try:
+        import numpy as np  # type: ignore
+
+        if isinstance(img, np.ndarray):
+            pil = Image.fromarray(img.astype("uint8"))
+            return pil
+    except Exception:
+        pass
+    raise ValueError(f"Unsupported Gradio image type: {type(img)}")
+
+
+def _chart_to_plot(chart_state: Any, chart_type: str = "Bar"):  # type: ignore[no-untyped-def]
+    """Identical to frontend ChartPanel — bar/pie toggle, question-aware (count vs distribution)."""
+    # chart_state may be list (legacy) or dict {"data": [...], "type": "count"}
+    data_type = "distribution"
+    if isinstance(chart_state, dict) and "data" in chart_state:
+        chart_data = chart_state.get("data", []) or []
+        data_type = str(chart_state.get("type", "distribution")).lower()
+    elif isinstance(chart_state, list):
+        chart_data = chart_state
+        # Heuristic fallback: if task was count, treat as count (small ints)
+        data_type = "distribution"
+    else:
+        return None
+    if not chart_data:
+        return None
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+
+        labels = [str(d.get("label", ""))[:12] for d in chart_data]
+        values = []
+        for d in chart_data:
+            try:
+                v = float(d.get("value", 0))
+            except Exception:
+                v = 0.0
+            # Gradio JSON/Plot chokes on NaN/inf — clamp to finite
+            if v != v or v in (float("inf"), float("-inf")):
+                v = 0.0
+            values.append(v)
+        colors = ["#38bdf8", "#22c55e", "#f59e0b", "#a78bfa", "#f43f5e", "#14b8a6"]
+        fig, ax = plt.subplots(figsize=(4, 2.2))
+        fig.patch.set_facecolor("#0f172a")
+        ax.set_facecolor("#0f172a")
+        is_count = data_type == "count"
+        is_change = data_type == "change"
+        title = "Count" if is_count else "Change" if is_change else "Distribution"
+        if chart_type.lower() == "pie":
+            fmt = "%1.0f" if is_count else "%1.0f%%"
+            # For change, pie with negative doesn't make sense — use absolute for pie
+            pie_vals = [abs(v) for v in values] if is_change else values
+            ax.pie(pie_vals, labels=labels, autopct=fmt, colors=colors[: len(values)], textprops={"color": "#e2e8f0", "fontsize": 8})
+            ax.set_title(title + (" (YOLO)" if is_count else " (delta T2-T1)" if is_change else " (measured)"), color="#e2e8f0", fontsize=10)
+        else:
+            bars = ax.bar(labels, values, color=[ "#f43f5e" if is_change and v < 0 else colors[i % len(colors)] for i, v in enumerate(values)], edgecolor="#334155")
+            if is_count:
+                ymax = max(values) * 1.25 if values else 5
+                ax.set_ylim(0, max(5, ymax))
+                ax.set_ylabel("Count", color="#94a3b8", fontsize=8)
+                for bar, v in zip(bars, values):
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1, f"{int(v)}", ha="center", va="bottom", color="#e2e8f0", fontsize=8)
+            elif is_change:
+                ax.set_ylim(-100, 100)
+                ax.set_ylabel("Δ %", color="#94a3b8", fontsize=8)
+                ax.axhline(0, color="#334155", linewidth=0.8)
+                for bar, v in zip(bars, values):
+                    y = v + (2 if v >= 0 else -4)
+                    ax.text(bar.get_x() + bar.get_width() / 2, y, f"{v:+.0f}%", ha="center", va="bottom" if v>=0 else "top", color="#e2e8f0", fontsize=8)
+            else:
+                ax.set_ylim(0, 100)
+                ax.set_ylabel("%", color="#94a3b8", fontsize=8)
+                for bar, v in zip(bars, values):
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1, f"{v:.0f}%", ha="center", va="bottom", color="#e2e8f0", fontsize=8)
+            ax.set_title(title + (" (YOLO)" if is_count else " (delta T2-T1)" if is_change else " (measured)"), color="#e2e8f0", fontsize=10)
+            ax.tick_params(colors="#94a3b8", labelsize=8)
+            plt.setp(ax.get_xticklabels(), rotation=20, ha="right")
+        plt.tight_layout()
+        plt.close(fig)
+        return fig
+    except Exception:
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+
+            plt.close("all")
+        except Exception:
+            pass
+        return None
+
+
+def _b64_to_pil(b64_str: str) -> Image.Image | None:
+    """Convert data:image/png;base64,... or raw base64 to PIL.Image."""
+    try:
+        import base64
+
+        data = b64_str
+        if "," in data:
+            data = data.split(",", 1)[1]
+        raw = base64.b64decode(data)
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception:
+        return None
+
+
+def _error_trace(message: str, started: float) -> dict[str, Any]:
+    """Minimal schema-valid ExecutionTrace for error paths.
+
+    The Vercel frontend reads trace.models_used.length / trace.evidence_refs.length
+    unconditionally — returning {} here used to crash the whole React tree with
+    `Cannot read properties of undefined (reading 'length')`. Always return the
+    full shape so failures render as a message, not a blank crash.
+    """
+    return {
+        "task": "error",
+        "models_used": [],
+        "parameters": {"error": str(message)[:500]},
+        "confidence": 0.0,
+        "evidence_refs": [],
+        "total_latency_ms": int((time.time() - started) * 1000),
+    }
+
+
+@spaces.GPU(duration=60)  # ZeroGPU: quota is deducted per requested second — 60 covers warm (~2s) + typical cold pull, burns half the quota of 120
+def predict(
+    query: str,
+    input_mode: str,
+    image_a: Any,
+    image_b: Any | None = None,
+    location_query: str | None = None,
+    location_query_2: str | None = None,
+) -> tuple[str, float, dict[str, Any], str, dict[str, Any], list[Any]]:
+    """Gradio handler — decorated for ZeroGPU scheduling.
+
+    Args:
+        query: natural language question
+        input_mode: single | optical-sar | bi-temporal (from gr.Radio)
+        image_a: first image (PIL from gr.Image)
+        image_b: second image for optical-sar / bi-temporal (PIL or None)
+        location_query: place name or lat,lon (alternative to upload, via Nominatim + Planetary Computer)
+        location_query_2: second place for bi-temporal T2 (optional, single location → 2 dates)
+
+    Returns:
+        (answer_markdown_bullets, confidence, execution_trace_json, evidence_md, chart_data, fetched_gallery)
+        Gradio outputs: Markdown, Number, JSON, Markdown, State (for Plot) + Gallery (for location preview)
+    """
+    started = time.time()
+    try:
+        return _predict_inner(
+            query, input_mode, image_a, image_b, location_query, location_query_2, started
+        )
+    except Exception as e:
+        logger.exception("Gradio predict outer failure: %s", e)
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        # gr.Error surfaces the message in the UI instead of generic "Query processing failed"
+        raise gr.Error(f"Query processing failed: {e}. Check trace JSON for detail.") from e
+
+
+def _predict_inner(
+    query: str,
+    input_mode: str,
+    image_a: Any,
+    image_b: Any | None,
+    location_query: str | None,
+    location_query_2: str | None,
+    started: float,
+) -> tuple[str, float, dict[str, Any], str, dict[str, Any], list[Any]]:
+    if not query or not query.strip():
+        return "Please enter a query.", 0.0, _error_trace("No query provided.", started), "No query provided.", {"data": [], "type": "distribution"}, []
+
+    # Validate mode
+    mode = (input_mode or "single").strip().lower()
+    if mode not in app_config.SUPPORTED_INPUT_MODES:
+        msg = f"Unsupported input_mode '{mode}'. Allowed: {sorted(app_config.SUPPORTED_INPUT_MODES)}"
+        return msg, 0.0, _error_trace(msg, started), "", {"data": [], "type": "distribution"}, []
+
+    # Collect images per mode — with location fallback (alternative to upload)
+    loc_q = (location_query or "").strip() or None
+    loc_q2 = (location_query_2 or "").strip() or None
+    has_location = bool(loc_q or loc_q2)
+    # Try to interpret location_query as lat,lon for direct coordinates fast-path is handled server-side via geocode parse
+    images: list[Any] = []
+    try:
+        if has_location and image_a is None and image_b is None:
+            # Pure location mode — let controller fetch Sentinel-2 via Planetary Computer (no image validation here)
+            images = []
+        elif mode == "single":
+            if has_location and image_a is None:
+                images = []  # location will be resolved server-side
+            elif image_a is None:
+                msg = "Upload one image for single mode, or enter a place name / lat,lon in *Search by location*."
+                return msg, 0.0, _error_trace(msg, started), "", {"data": [], "type": "distribution"}, []
+            else:
+                images.append(_coerce_gradio_image(image_a, "image.png"))
+        elif mode in ("optical-sar", "bi-temporal"):
+            if has_location and image_a is None and image_b is None:
+                images = []  # location fetches both images (optical+SAR or T1+T2)
+            elif has_location and (image_a is None or image_b is None):
+                # For bi-temporal with single location → server fetches 2 dates, so one location is enough
+                if has_location and mode == "bi-temporal":
+                    images = []
+                else:
+                    msg = f"Upload two images for {mode} (both slots required), or enter location(s) to auto-fetch."
+                    return msg, 0.0, _error_trace(msg, started), "", {"data": [], "type": "distribution"}, []
+            elif image_a is None or image_b is None:
+                msg = f"Upload two images for {mode} (both slots required)."
+                return msg, 0.0, _error_trace(msg, started), "", {"data": [], "type": "distribution"}, []
+            else:
+                images.append(_coerce_gradio_image(image_a, "image0.png"))
+                images.append(_coerce_gradio_image(image_b, "image1.png"))
+        else:
+            msg = f"Unknown mode {mode}"
+            return msg, 0.0, _error_trace(msg, started), "", {"data": [], "type": "distribution"}, []
+    except Exception as e:
+        logger.exception("Image coercion failed: %s", e)
+        return f"Image error: {e}", 0.0, _error_trace(f"Image error: {e}", started), "", {"data": [], "type": "distribution"}, []
+
+    # Delegate to controller (reuses validate_inputs, classify_task, registry.predict, ExecutionTrace)
+    # If location provided and images empty, controller resolves via geocode + Planetary Computer STAC
+    try:
+        resp = controller_handle(
+            query=query.strip(),
+            images=images,
+            input_mode=mode,
+            location_query=loc_q,
+            location_query_2=loc_q2,
+        )
+    except Exception as e:
+        # Controller already catches specialist failures, but validate_inputs raises HTTPException
+        # which we surface as user-visible error with full detail
+        import traceback as _tb
+        try:
+            from fastapi import HTTPException as _HTTPException
+
+            if isinstance(e, _HTTPException):
+                msg = f"Validation error ({e.status_code}): {e.detail}"
+                return msg, 0.0, _error_trace(msg, started), f"Validation failed: {e.detail}", {"data": [], "type": "distribution"}, []
+        except Exception:
+            pass
+        logger.exception("Controller failed: %s", e)
+        # NOTE: do NOT call get_model_info() here — it blocks on HF download
+        # inside the dying GPU worker and masks the real error. Surface the
+        # controller message directly so the UI gets detail instead of a
+        # generic failure.
+        tb_str = _tb.format_exc()
+        err_trace = _error_trace(f"Controller error: {e}", started)
+        err_trace["traceback"] = tb_str[:3000]
+        return f"Controller error: {e}", 0.0, err_trace, f"Error: {e}\n{tb_str[:1500]}", {"data": [], "type": "distribution"}, []
+
+    # Build evidence markdown for display
+    evidence_md_parts: list[str] = []
+    for ev in resp.evidence:
+        icon = {"bounding_box": "▢", "overlay": "◈", "heatmap": "▣", "saliency": "◎", "image_ref": "▣"}.get(ev.type, "•")
+        line = f"{icon} **{ev.type.replace('_', ' ').upper()}** — {ev.description}"
+        if ev.coordinates:
+            line += f" `coords={ev.coordinates}`"
+        evidence_md_parts.append(line)
+    evidence_md = "\n\n".join(evidence_md_parts) if evidence_md_parts else "No evidence."
+
+    # Execution trace as JSON-serializable dict (Pydantic → dict)
+    try:
+        trace_dict = resp.execution_trace.model_dump()  # pydantic v2
+    except Exception:
+        trace_dict = resp.execution_trace.dict()  # fallback v1
+
+    # Confidence gauge text — clamp to finite [0,1] so gr.Number/JSON never chokes
+    try:
+        conf = float(resp.confidence)
+    except Exception:
+        conf = 0.0
+    if conf != conf or conf in (float("inf"), float("-inf")):
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+    wall_ms = int((time.time() - started) * 1000)
+
+    # Append wall time to trace for transparency (not part of schema, just info)
+    trace_dict["_gradio_wall_ms"] = wall_ms
+
+    logger.info("Gradio predict: mode=%s task=%s conf=%.3f wall=%dms answer_len=%d", mode, trace_dict.get("task"), conf, wall_ms, len(resp.answer))
+
+    # Chart data for identical bar/pie toggle — question-aware (count vs distribution)
+    chart_data: list[dict[str, Any]] = []
+    chart_type_data: str = "distribution"
+    def _safe_chart_items(items: Any) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        try:
+            for c in items or []:
+                try:
+                    label = str(getattr(c, "label", "?"))[:12]
+                    v = float(getattr(c, "value", 0))
+                except Exception:
+                    continue
+                if v != v or v in (float("inf"), float("-inf")):
+                    v = 0.0
+                out.append({"label": label, "value": v})
+        except Exception:
+            return []
+        return out
+
+    try:
+        # Prefer flat chart, else structured
+        if getattr(resp, "chart", None):
+            chart_data = _safe_chart_items(resp.chart)  # type: ignore[attr-defined]
+        elif getattr(resp, "structured", None) and resp.structured and resp.structured.chart:  # type: ignore[attr-defined]
+            chart_data = _safe_chart_items(resp.structured.chart)  # type: ignore[attr-defined]
+        # Chart type: from response field, else infer from task
+        ct = getattr(resp, "chart_type", None)
+        if ct:
+            chart_type_data = str(ct)
+        elif getattr(resp, "structured", None) and resp.structured and getattr(resp.structured, "chart_type", None):  # type: ignore[attr-defined]
+            chart_type_data = str(resp.structured.chart_type)  # type: ignore[attr-defined]
+        else:
+            chart_type_data = "count" if trace_dict.get("task") == "count" else "distribution"
+    except Exception:
+        chart_data = []
+        chart_type_data = "distribution"
+
+    chart_state = {"data": chart_data, "type": chart_type_data}
+    # Echo chart into the trace: gr.State outputs serialize as null outside a
+    # live Gradio session, so API clients (/gradio_api/call/predict) rebuild the
+    # results chart from these keys (same convention as _gradio_wall_ms above).
+    trace_dict["_chart"] = chart_data
+    trace_dict["_chart_type"] = chart_type_data
+
+    # Build fetched gallery for location mode (show Sentinel-2 preview in viewer)
+    # gr.Gallery expects a list — never return None (serialization flake).
+    fetched_gallery: list[Any] = []
+    try:
+        resolved = getattr(resp, "resolved_images", None)
+        if resolved:
+            gallery = []
+            for ri in resolved:
+                try:
+                    b64 = ri.preview_b64 if hasattr(ri, "preview_b64") else ri.get("preview_b64") if isinstance(ri, dict) else None
+                    display = ri.display_name if hasattr(ri, "display_name") else ri.get("display_name") if isinstance(ri, dict) else None
+                    scene = ri.scene_id if hasattr(ri, "scene_id") else ri.get("scene_id") if isinstance(ri, dict) else None
+                    caption = display or scene or "Fetched Sentinel-2"
+                    pil = _b64_to_pil(b64) if b64 else None
+                    if pil is not None:
+                        gallery.append((pil, caption))
+                except Exception:
+                    continue
+            if gallery:
+                fetched_gallery = gallery
+        # Also surface location in trace for Gradio viewer
+        if has_location and isinstance(trace_dict.get("parameters", {}), dict) and trace_dict.get("parameters", {}).get("location_resolved"):
+            trace_dict["_location_preview_count"] = len(fetched_gallery)
+    except Exception as e:
+        logger.warning("Gallery build failed (non-fatal): %s", e)
+        fetched_gallery = []
+
+    return resp.answer, conf, trace_dict, evidence_md, chart_state, fetched_gallery
+
+
+# ── Gradio UI — 3-zone parity with frontend/src/App.tsx but in Blocks ──
+with gr.Blocks(
+    title="SatQuery AI — Agentic Remote-Sensing VLM",
+    theme=gr.themes.Soft(
+        font=[gr.themes.GoogleFont("Space Grotesk"), "ui-sans-serif", "system-ui"],
+        font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace", "monospace"],
+    ),
+    css="""
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+        .gradio-container {max-width: 1280px !important; font-family: 'Inter', 'Space Grotesk', ui-sans-serif, system-ui, sans-serif !important}
+        h1, h2, h3, .panel-label, .tag-muted {font-family: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif !important; letter-spacing: -0.02em}
+        .panel {border: 1px solid #2a3a4a; border-radius: 10px; background: #0f1b2a0a; padding: 12px}
+        /* tighten markdown + json */
+        .prose {font-family: 'Inter', sans-serif !important}
+        code, pre {font-family: 'JetBrains Mono', ui-monospace, monospace !important}
+        """,
+) as demo:
+    gr.Markdown(
+        """
+        # SatQuery AI — Agentic Vision-Language Assistant for Remote Sensing
+        **Smart India Hackathon 2026** — Natural-language querying of single & paired satellite imagery (optical, SAR) with evidence-grounded answers and full `ExecutionTrace`. Stage-2 **VQA+grounding real QLoRA Qwen2-VL-2B `imadityasarkar/satquery-phase2-vrsbench`** (VRSBench/RSVQA SFT continuing Stage-1 BigEarthNet); Stage-3 **change real `imadityasarkar/cdvqa_change` bi-temporal**, fusion stub.
+        > **ZeroGPU:** Blackwell `48GB large` via `@spaces.GPU(duration=60)` — ~1s vs `30s` CPU. **Docker local** (`make pitch-demo`, `SATQUERY_FORCE_CPU=1`) stays CPU-only for i5/16GB.
+        """
+    )
+
+    with gr.Row():
+        with gr.Column(scale=2, min_width=300):
+            gr.Markdown("### Imagery Input")
+            input_mode = gr.Radio(
+                choices=[("SINGLE", "single"), ("OPTICAL+SAR", "optical-sar"), ("BI-TEMPORAL", "bi-temporal")],
+                value="single",
+                label="Input mode",
+                info="single=1 image, optical-sar=2 (Optical+SAR), bi-temporal=2 (T1+T2)",
+            )
+            image_a = gr.Image(label="Image / Optical / T1", type="pil", sources=["upload", "clipboard"], height=280)
+            image_b = gr.Image(label="Second image (SAR / T2) — required for optical-sar / bi-temporal", type="pil", sources=["upload"], height=280, visible=False)
+            gr.Markdown("`GeoTIFF/TIFF/PNG/JPEG` accepted (`.tif/.tiff/.png/.jpg/.jpeg`). Controller validates `single→1` `optical-sar→2` `bi-temporal→2` and `Geotiff` bands via `rasterio` when installed.")
+
+            # --- Search by location (alternative to upload) ---
+            gr.Markdown("### Search by location _(alternative to upload)_")
+            gr.Markdown(
+                "Type a place name **or** `lat,lon` and skip upload — auto-fetches Sentinel-2 via **Nominatim → Planetary Computer** (`sentinel-2-l2a`, 2km AOI, least-cloudy). For `bi-temporal` with single location, fetches 2 most recent dates."
+            )
+            location_query = gr.Textbox(
+                label="Place name or coordinates (location T1 / single)",
+                placeholder="Bengaluru, India  or  12.97, 77.59",
+                lines=1,
+            )
+            location_query_2 = gr.Textbox(
+                label="Second location (T2) — bi-temporal only (leave empty for 2 dates at T1)",
+                placeholder="Mumbai, India  or  19.07, 72.87",
+                lines=1,
+                visible=False,
+            )
+            fetched_gallery = gr.Gallery(
+                label="Fetched Sentinel-2 Preview (location mode)",
+                show_label=True,
+                columns=2,
+                height=280,
+                visible=True,
+                object_fit="contain",
+            )
+            gr.Markdown("`Upload` takes precedence if both are provided; leave images empty to use location.")
+
+            # Toggle second image + second location visibility by mode
+            def _toggle_second(mode: str):
+                vis = mode in ("optical-sar", "bi-temporal")
+                return gr.update(visible=vis), gr.update(visible=mode == "bi-temporal")
+
+            input_mode.change(fn=_toggle_second, inputs=[input_mode], outputs=[image_b, location_query_2])
+
+            gr.Markdown("### Query")
+            query = gr.Textbox(
+                label="Natural-language query",
+                placeholder="Describe the land cover in this satellite image.",
+                lines=3,
+            )
+            gr.Examples(
+                examples=[
+                    ["Describe the land cover in this satellite image.", "single"],
+                    ["What changed between these two dates?", "bi-temporal"],
+                    ["Where is the building? Locate it.", "single"],
+                    ["Fuse optical and SAR — detect flooded areas", "optical-sar"],
+                ],
+                inputs=[query, input_mode],
+                label="Suggestions (click to fill)",
+            )
+            run_btn = gr.Button("Execute Analysis", variant="primary")
+            clear_btn = gr.Button("Clear", variant="secondary")
+            status = gr.Markdown("")
+
+        with gr.Column(scale=3):
+            gr.Markdown("### Intelligence Result — bullets replace paragraph (3-6 bullets, chart below)")
+            answer = gr.Markdown(label="Answer (bullets)", value="*Awaiting analysis — bullets will appear here*")
+            confidence = gr.Number(label="Confidence (0–1)", precision=3)
+            evidence = gr.Markdown(label="Evidence")
+            # Chart — identical to React (bar/pie toggle, question-aware count/distribution)
+            chart_type = gr.Radio(choices=["Bar", "Pie"], value="Bar", label="Chart type", info="Bar/Pie toggle")
+            chart_plot = gr.Plot(label="Distribution")
+            chart_state = gr.State(value={"data": [], "type": "distribution"})
+
+        with gr.Column(scale=2, min_width=320):
+            gr.Markdown("### Execution Trace (graded)")
+            trace = gr.JSON(label="ExecutionTrace — task, models_used[{is_real,is_stub}], parameters, total_latency_ms", value={})
+            gr.Markdown(
+                """
+                **Trace contract:** `docs/execution_trace_schema.md` (`backend/schemas` ↔ `frontend/src/types/api.ts`).
+                `confidence` mirrors top-level `confidence` (`log_softmax` when available, else heuristic). `is_real` = adapter loaded.
+                """
+            )
+            health = gr.JSON(label="Health (live, from registry.health)", value={})
+            refresh_health = gr.Button("Refresh health", size="sm")
+
+    # Health helper — prefilled placeholder at startup (no GPU, no model load)
+    # Real health (with model load) is on-demand via Refresh button inside ZeroGPU
+    _health_prefilled: dict[str, Any] = {
+        "status": "Space ready — click Refresh health or run a query",
+        "compute": "zero-a10g (SATQUERY_FORCE_CPU=0)",
+        "note": "Health with model load is on-demand to avoid No CUDA at startup",
+        "adapter_path": "imadityasarkar/satquery-phase2-vrsbench",
+        "change_adapter_path": "imadityasarkar/cdvqa_change",
+        "fusion_adapter_path": "imadityasarkar/satquery-phase2-vrsbench",
+        "specialists": {
+            "vqa (real)": {"is_real": "pending — run a query or Refresh health"},
+            "change_detection (real)": {"is_real": "pending — run a query or Refresh health"},
+            "optical_sar_fusion (real)": {"is_real": "pending — run a query or Refresh health"},
+        },
+    }
+
+    @spaces.GPU(duration=30)
+    def _health_gpu() -> dict[str, Any]:
+        # Cheap by default: NO model load inside the GPU worker (loading all 3
+        # Qwen2-VL-2B adapters + YOLO in one 30s worker OOMs and burns quota).
+        # Set SATQUERY_HEALTH_LOAD_MODEL=1 in Space Variables to opt into a
+        # full registry.health() load for debugging.
+        if os.getenv("SATQUERY_HEALTH_LOAD_MODEL", "0").lower() not in ("1", "true", "yes", "on"):
+            info: dict[str, Any] = dict(_health_prefilled)
+            info["status"] = "Space ready (cheap health — no model load)"
+            info["note"] = "Set SATQUERY_HEALTH_LOAD_MODEL=1 to load models in this worker (slow, may OOM)"
+            try:
+                import torch  # type: ignore
+
+                info["cuda_available"] = bool(torch.cuda.is_available())
+                try:
+                    info["cuda_device"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            return info
+        try:
+            h = registry.health()
+            return h
+        except Exception as e:
+            import traceback
+            return {"error": str(e), "traceback": traceback.format_exc()[:2000]}
+
+    def _health_placeholder() -> dict[str, Any]:
+        # No GPU, no model load — safe at startup
+        return _health_prefilled
+
+    def _update_chart(chart_state: Any, chart_type: str):  # type: ignore[no-untyped-def]
+        try:
+            return _chart_to_plot(chart_state or {"data": [], "type": "distribution"}, chart_type or "Bar")
+        finally:
+            try:
+                import matplotlib.pyplot as plt  # type: ignore
+
+                plt.close("all")
+            except Exception:
+                pass
+
+    refresh_health.click(fn=_health_gpu, outputs=[health])
+    # Initial health load — prefilled, no GPU quota cost
+    demo.load(fn=_health_placeholder, outputs=[health])
+
+    # Wire predict — queue required for @spaces.GPU; show status updates; identical bullets+charts + fetched gallery
+    run_btn.click(
+        fn=predict,
+        inputs=[query, input_mode, image_a, image_b, location_query, location_query_2],
+        outputs=[answer, confidence, trace, evidence, chart_state, fetched_gallery],
+        show_progress=True,
+    ).then(fn=_update_chart, inputs=[chart_state, chart_type], outputs=[chart_plot])
+
+    # Pressing Enter in location boxes or query should also execute (UX parity with React QueryInput Enter)
+    for _tb in (location_query, location_query_2, query):
+        _tb.submit(
+            fn=predict,
+            inputs=[query, input_mode, image_a, image_b, location_query, location_query_2],
+            outputs=[answer, confidence, trace, evidence, chart_state, fetched_gallery],
+            show_progress=True,
+        ).then(fn=_update_chart, inputs=[chart_state, chart_type], outputs=[chart_plot])
+
+    chart_type.change(fn=_update_chart, inputs=[chart_state, chart_type], outputs=[chart_plot])
+
+    gr.Markdown(
+        """
+        ---
+        **Local Docker (CPU-only, i5/16GB):** `make pitch-demo` or `SATQUERY_FORCE_CPU=1 uvicorn backend.main:app --port 8000` + `npm run dev` (`5173`). **HF Spaces Gradio ZeroGPU:** this `app.py` on `zero-a10g` with `SATQUERY_FORCE_CPU=0` (`Spaces → Settings → Variables`). See `docs/hf_spaces.md` (Docker) and `docs/hf_spaces_gradio.md` (ZeroGPU).
+        If **Execute Analysis** does nothing, check `Spaces → Logs` for `Gradio startup health: deferred` and `Spaces → Settings → Hardware` is `zero-a10g`. First click cold-pulls ~4GB (30-60s), warm ~1.2s. `predict` uses `duration=60` (quota deducted per requested second, so keep it tight); health is cheap (no model load) unless `SATQUERY_HEALTH_LOAD_MODEL=1`.
+        """
+    )
+
+    clear_btn.click(
+        fn=lambda: (None, None, "", "", "", "single", "*Awaiting analysis — bullets will appear here*", 0.0, {}, "", {"data": [], "type": "distribution"}, None, []),
+        inputs=None,
+        outputs=[
+            image_a,
+            image_b,
+            location_query,
+            location_query_2,
+            query,
+            input_mode,
+            answer,
+            confidence,
+            trace,
+            evidence,
+            chart_state,
+            chart_plot,
+            fetched_gallery,
+        ],
+    )
+
+# Required for @spaces.GPU scheduling — without queue the GPU worker never drains and UI hangs
+demo.queue(
+    max_size=20,
+    default_concurrency_limit=1,
+)
+# Optional unified FastAPI + Gradio (Docker / local CPU combined mode).
+# OPT-IN via SATQUERY_MOUNT_FASTAPI=1 (Dockerfile sets it); default OFF because
+# mount_gradio_app mutates `demo` (custom_mount_path, config snapshot) before
+# launch — unsafe for the HF Gradio SDK Space, which must serve the Blocks app
+# unchanged. New Space runs `python app.py` → demo.queue + demo.launch only, and
+# the Vercel frontend calls that Gradio queue (/gradio_api/call/predict), never
+# the FastAPI /api path. Both modes use the SAME pipeline (controller → registry
+# → ZeroGPU); no duplicate inference, no backend code duplicated.
+if os.getenv("SATQUERY_MOUNT_FASTAPI", "0") == "1":
+    try:
+        from backend.main import app as fastapi_app  # type: ignore
+
+        # Mount Gradio demo onto FastAPI so /api/* (FastAPI) and /gradio (Gradio UI) share one port
+        # HF Docker Spaces can then run `uvicorn app:app --host 0.0.0.0 --port 7860`
+        if hasattr(gr, "mount_gradio_app"):
+            app = gr.mount_gradio_app(fastapi_app, demo, path="/gradio")  # type: ignore
+            logger.info("Unified app created: FastAPI + Gradio mounted at /gradio (Docker/local)")
+        else:
+            app = fastapi_app
+            logger.info("Unified app: gr.mount_gradio_app not available, exposing FastAPI only")
+    except Exception as e:
+        logger.debug(f"Unified app mount skipped (SATQUERY_MOUNT_FASTAPI=1 but mount failed): {e}")
+        app = None  # type: ignore
+else:
+    logger.info("SATQUERY_MOUNT_FASTAPI unset — Gradio-only mode (demo.queue + demo.launch)")
+    app = None  # type: ignore  # only defined for `uvicorn app:app` combined mode
+
+if __name__ == "__main__":
+    # HF Spaces injects GRADIO_SERVER_NAME/PORT; locally default 7860 for parity with Docker PORT
+    port = int(os.getenv("PORT") or os.getenv("GRADIO_SERVER_PORT") or 7860)
+    # theme/css are on Blocks (not launch) for compat with older launch() that rejects theme
+    try:
+        demo.launch(
+            server_name="0.0.0.0",
+            server_port=port,
+            show_error=True,
+        )
+    except TypeError:
+        # fallback for very old Gradio where show_error not supported
+        demo.launch(
+            server_name="0.0.0.0",
+            server_port=port,
+        )

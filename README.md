@@ -19,13 +19,14 @@ license: mit
 <img src="assets/banner3.png" alt="SatQuery AI" width="1000" />
 
 [![OpenEnv](https://img.shields.io/badge/SIH-2026-blue?style=flat-square)](https://www.sih.gov.in/)
+[![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace%20Spaces-yellow?style=flat-square)](https://huggingface.co/spaces/imadityasarkar/satquery-backend)
 [![Vercel](https://img.shields.io/badge/Vercel-Live-black?style=flat-square)](https://sat-query-ai-sih-26.vercel.app)
 [![VLM](https://img.shields.io/badge/VLM-Qwen2--VL--2B-purple?style=flat-square)](#tech-stack)
 [![Trace](https://img.shields.io/badge/ExecutionTrace-Graded-red?style=flat-square)](#how-it-works--pipeline-flowchart)
 
 Smart India Hackathon 2026 — Agentic Vision-Language Intelligence for Earth Observation
 
-[🚀 Live App](https://sat-query-ai-sih-26.vercel.app) · [🛰️ Live Space] · [📓 Training Notebook](https://colab.research.google.com/drive/1q7wYp1Vtwp1oigC9E9FGWGEOWGrm5Szy) · [📝 Execution Trace](docs/execution_trace_schema.md)
+[🚀 Live App](https://sat-query-ai-sih-26.vercel.app) · [🛰️ Live Space](https://huggingface.co/spaces/imadityasarkar/satquery-ai) · [📓 Training Notebook](https://colab.research.google.com/github/awdtyo/SatQueryAI-SIH26/blob/main/training/notebooks/satquery_ai_qlora_finetune.ipynb) · [📝 Execution Trace](docs/execution_trace_schema.md)
 
 </div>
 
