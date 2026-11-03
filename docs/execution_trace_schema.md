@@ -12,7 +12,7 @@ class EvidenceRef(BaseModel):
     image_index: int | None = 0
 
 class ModelTraceEntry(BaseModel):
-    name: str              # e.g. imadityasarkar/satquery-qwen2vl-stage1-bigearthnet
+    name: str              # e.g. HARSHITSINGH/satquery-qwen2vl-stage1-bigearthnet
     role: str              # task, e.g. vqa / change_detection
     parameters: dict[str, Any]  # {input_mode, image_count, adapter_path, base_model}
     latency_ms: int
@@ -82,12 +82,12 @@ type QueryResponse = {
 - `execution_trace.confidence == confidence` (top-level mirrors trace).
 - `models_used[].is_real == !is_stub` for non-degraded paths; degraded VQA returns `is_real=false is_stub=true` with `load_error` in `get_model_info()` `backend/models/vqa.py:375`.
 - `evidence_refs` and `evidence` are mirrors — controller builds both from same `result["evidence"]` `backend/controller/__init__.py:247`.
-- `task` is normalized via `registry._normalize_task()` `backend/registry.py:59` and `controller.classify_task()` `backend/controller/__init__.py:182` (`single`->`vqa`/`grounding`/`count`, `bi-temporal`->`change_detection` via `imadityasarkar/cdvqa_change`, `optical-sar`->`optical_sar_fusion`).
+- `task` is normalized via `registry._normalize_task()` `backend/registry.py:59` and `controller.classify_task()` `backend/controller/__init__.py:182` (`single`->`vqa`/`grounding`/`count`, `bi-temporal`->`change_detection` via `HARSHITSINGH/cdvqa_change`, `optical-sar`->`optical_sar_fusion`).
 - `total_latency_ms` includes validation + classification + specialist `latency_ms` (specialist may supply `_latency_ms`).
 
 ## Health
 
-`GET /health` and `GET /api/health` return `HealthResponse` `backend/api/__init__.py:23`. `specialists` is `registry.health()` `backend/registry.py:118` keyed by `"vqa (real)"`, `"yolo (real)"`, `"grounding (real)"`, `"change_detection (real)"` (`imadityasarkar/cdvqa_change`), `"optical_sar_fusion (stub)"`.
+`GET /health` and `GET /api/health` return `HealthResponse` `backend/api/__init__.py:23`. `specialists` is `registry.health()` `backend/registry.py:118` keyed by `"vqa (real)"`, `"yolo (real)"`, `"grounding (real)"`, `"change_detection (real)"` (`HARSHITSINGH/cdvqa_change`), `"optical_sar_fusion (stub)"`.
 
 ## Frontend rendering
 
